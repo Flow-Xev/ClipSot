@@ -1,0 +1,271 @@
+name: Build Signed ClipSot APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ClipSot Release
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout GitHub repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Locate and extract ClipSot source
+      - name: Extract ClipSot source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="$(find . -maxdepth 5 -type f \
+            -iname 'ClipSot_stage3b.zip' \
+            -not -path './.git/*' -print -quit)"
+
+          if [ -n "$ZIP" ]; then
+            echo "Found source ZIP: $ZIP"
+            mkdir -p "$RUNNER_TEMP/clipsot_source"
+            unzip -q "$ZIP" -d "$RUNNER_TEMP/clipsot_source"
+
+            PUBSPEC="$(find "$RUNNER_TEMP/clipsot_source" \
+              -name pubspec.yaml -print -quit)"
+          else
+            echo "ZIP not found. Checking for already extracted source."
+            PUBSPEC="$(find . -name pubspec.yaml \
+              -not -path './.git/*' \
+              -not -path './build/*' -print -quit)"
+          fi
+
+          if [ -z "${PUBSPEC:-}" ]; then
+            echo "ERROR: ClipSot pubspec.yaml not found."
+            find . -maxdepth 4 -type f | head -150
+            exit 1
+          fi
+
+          SOURCE_ROOT="$(dirname "$PUBSPEC")"
+
+          echo "Source directory: $SOURCE_ROOT"
+
+          # Only copy when the source is not already the repo root
+          if [ "$(cd "$SOURCE_ROOT" && pwd)" != "$(pwd)" ]; then
+            cp -a "$SOURCE_ROOT/." .
+          fi
+
+          test -f pubspec.yaml
+          test -f setup.sh
+          test -d lib
+          test -d android_overlay
+
+          echo "ClipSot source ready."
+
+      # 3. Install Java
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 4. Install Flutter
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # 5. Check Flutter
+      - name: Flutter diagnostics
+        run: |
+          flutter --version
+          flutter doctor -v
+
+      # 6. Generate Android project
+      - name: Generate Android project
+        run: |
+          chmod +x setup.sh
+          ./setup.sh
+
+          # flutter create adds a default template test that does not match ClipSot
+          rm -f test/widget_test.dart
+
+          test -d android/app
+          test -f android/app/src/main/AndroidManifest.xml
+
+      # 7. Validate required GitHub secrets
+      - name: Validate signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          test -n "$KEYSTORE_BASE64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+
+          echo "All signing secrets are configured."
+
+      # 8. Decode release keystore
+      - name: Install release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p android/app
+
+          printf '%s' "$KEYSTORE_BASE64" \
+            | base64 --decode > android/app/clipsot-release.jks
+
+          test -s android/app/clipsot-release.jks
+
+          echo "Release keystore installed."
+
+      # 9. Configure Android release signing
+      - name: Configure release signing
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          candidates = [
+              Path("android/app/build.gradle.kts"),
+              Path("android/app/build.gradle"),
+          ]
+
+          gradle = next((p for p in candidates if p.exists()), None)
+
+          if gradle is None:
+              raise SystemExit("Android app Gradle file not found")
+
+          text = gradle.read_text()
+
+          if "clipsot-release.jks" in text:
+              raise SystemExit("Release signing already configured; refusing duplicate setup")
+
+          if gradle.name.endswith(".kts"):
+              signing = """
+              signingConfigs {
+                  create("release") {
+                      storeFile = file("clipsot-release.jks")
+                      storePassword = System.getenv("KEYSTORE_PASSWORD")
+                      keyAlias = System.getenv("KEY_ALIAS")
+                      keyPassword = System.getenv("KEY_PASSWORD")
+                  }
+              }
+          """
+              release_line = 'signingConfig = signingConfigs.getByName("release")'
+          else:
+              signing = """
+              signingConfigs {
+                  release {
+                      storeFile file("clipsot-release.jks")
+                      storePassword System.getenv("KEYSTORE_PASSWORD")
+                      keyAlias System.getenv("KEY_ALIAS")
+                      keyPassword System.getenv("KEY_PASSWORD")
+                  }
+              }
+          """
+              release_line = 'signingConfig signingConfigs.release'
+
+          if "android {" not in text:
+              raise SystemExit("Android block not found")
+
+          text = text.replace("android {", "android {\n" + signing, 1)
+
+          pattern = r'(buildTypes\s*\{\s*release\s*\{)'
+          text, count = re.subn(
+              pattern,
+              lambda m: m.group(1) + "\n            " + release_line,
+              text,
+              count=1
+          )
+
+          if count != 1:
+              raise SystemExit("Could not find release build type")
+
+          # The Flutter template assigns the DEBUG key inside release { }.
+          # The last assignment wins, so remove it or the APK is debug-signed.
+          text, dbg = re.subn(
+              r'^[ \t]*signingConfig\s*=?\s*signingConfigs\.(?:getByName\("debug"\)|debug)[ \t]*\n',
+              "",
+              text,
+              flags=re.M,
+          )
+          print("Removed", dbg, "debug signingConfig line(s)")
+
+          gradle.write_text(text)
+          print("Configured release signing in", gradle)
+          PY
+
+      # 10. Get dependencies
+      - name: Get Flutter dependencies
+        run: flutter pub get
+
+      # 11. Analyze project
+      - name: Analyze Flutter code
+        run: flutter analyze
+        continue-on-error: true
+
+      # 12. Run unit tests
+      - name: Run Flutter tests
+        run: flutter test
+
+      # 13. Build signed release APK
+      - name: Build release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          flutter build apk --release
+
+          test -s build/app/outputs/flutter-apk/app-release.apk
+
+      # 14. Verify APK signature (and make sure it is NOT the debug key)
+      - name: Verify APK signature
+        run: |
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          APKSIGNER="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)/apksigner"
+
+          "$APKSIGNER" verify --verbose "$APK"
+
+          if "$APKSIGNER" verify --print-certs "$APK" | grep -qi "Android Debug"; then
+            echo "ERROR: APK is signed with the debug key, not the release key."
+            exit 1
+          fi
+
+      # 15. Upload APK
+      - name: Upload ClipSot Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipSot-Release-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      # 16. Upload build information
+      - name: Collect build information
+        if: always()
+        run: |
+          mkdir -p build-info
+          flutter --version > build-info/flutter-version.txt 2>&1 || true
+          git rev-parse HEAD > build-info/commit.txt
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipSot-Build-Information
+          path: build-info/
+          if-no-files-found: ignore
+          retention-days: 3
